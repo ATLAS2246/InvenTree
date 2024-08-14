@@ -67,16 +67,7 @@
           </ul>
         </li>
         {% endif %}
-        <li class='nav-item dropdown'>
-          <a class='nav-link dropdown-toggle' href='#' id='buyMenuDropdown' role='button' data-bs-toggle='dropdown'>
-            <span class='fas fa-shopping-cart icon-header'></span>{% trans "wobwobwobwobowob" %}
-          </a>
-          <ul class='dropdown-menu' aria-labelledby="buyMenuDropdown">
-            <li><a class='dropdown-item' href="{% url 'supplier-index' %}"><span class='fas fa-building icon-header'></span>{% trans "Suppliers" %}</a></li>
-            <li><a class='dropdown-item' href="{% url 'manufacturer-index' %}"><span class='fas fa-industry icon-header'></span>{% trans "Manufacturers" %}</a></li>
-            <li><a class='dropdown-item' href="{% url 'purchase-order-index' %}"><span class='fas fa-list icon-header'></span>{% trans "Purchase Orders" %}</a></li>
-          </ul>
-        </li>
+
         {% if plugin_nav %}
         {% plugin_list as pl_list %}
         {% for plugin_key, plugin in pl_list.items %}
