@@ -850,7 +850,7 @@ export function useTransferStockItem(props: StockOperationProps) {
     ...props,
     fieldGenerator: stockTransferFields,
     endpoint: ApiEndpoints.stock_transfer,
-    title: t`wibble wobble the stock`
+    title: t`Transfer Stock`
   });
 }
 
