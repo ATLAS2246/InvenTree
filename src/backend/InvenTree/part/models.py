@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import decimal
 import hashlib
+import inspect
 import logging
 import math
 import os
@@ -230,10 +231,7 @@ class PartCategory(InvenTree.models.InvenTreeTree):
         """Get all unique parameter names for all parts from this category."""
         unique_parameters_names = []
 
-        if prefetch:
-            parts = prefetch
-        else:
-            parts = self.prefetch_parts_parameters(cascade=cascade)
+        parts = prefetch or self.prefetch_parts_parameters(cascade=cascade)
 
         for part in parts:
             for parameter in part.parameters.all():
@@ -247,10 +245,7 @@ class PartCategory(InvenTree.models.InvenTreeTree):
         """Get all parameter names and values for all parts from this category."""
         category_parameters = []
 
-        if prefetch:
-            parts = prefetch
-        else:
-            parts = self.prefetch_parts_parameters(cascade=cascade)
+        parts = prefetch or self.prefetch_parts_parameters(cascade=cascade)
 
         for part in parts:
             part_parameters = {
@@ -403,6 +398,7 @@ class Part(
         component: Can this part be used to make other parts?
         purchaseable: Can this part be purchased from suppliers?
         trackable: Trackable parts can have unique serial numbers assigned, etc, etc
+        testable: Testable parts can have test results recorded against their stock items
         active: Is this part active? Parts are deactivated instead of being deleted
         locked: This part is locked and cannot be edited
         virtual: Is this part "virtual"? e.g. a software product or similar
@@ -774,7 +770,22 @@ class Part(
             for plugin in registry.with_mixin('validation'):
                 # Run the serial number through each custom validator
                 # If the plugin returns 'True' we will skip any subsequent validation
-                if plugin.validate_serial_number(serial, self):
+
+                result = False
+
+                if hasattr(plugin, 'validate_serial_number'):
+                    signature = inspect.signature(plugin.validate_serial_number)
+
+                    if 'stock_item' in signature.parameters:
+                        # 2024-08-21: New method signature accepts a 'stock_item' parameter
+                        result = plugin.validate_serial_number(
+                            serial, self, stock_item=stock_item
+                        )
+                    else:
+                        # Old method signature - does not accept a 'stock_item' parameter
+                        result = plugin.validate_serial_number(serial, self)
+
+                if result is True:
                     return True
         except ValidationError as exc:
             if raise_error:
@@ -916,24 +927,26 @@ class Part(
                     'IPN': _('Duplicate IPN not allowed in part settings')
                 })
 
-        if self.revision_of and self.revision:
-            if (
+        if (
+            self.revision_of
+            and self.revision
+            and (
                 Part.objects.exclude(pk=self.pk)
                 .filter(revision_of=self.revision_of, revision=self.revision)
                 .exists()
-            ):
-                raise ValidationError(_('Duplicate part revision already exists.'))
+            )
+        ):
+            raise ValidationError(_('Duplicate part revision already exists.'))
 
         # Ensure unique across (Name, revision, IPN) (as specified)
-        if self.revision or self.IPN:
-            if (
-                Part.objects.exclude(pk=self.pk)
-                .filter(name=self.name, revision=self.revision, IPN=self.IPN)
-                .exists()
-            ):
-                raise ValidationError(
-                    _('Part with this Name, IPN and Revision already exists.')
-                )
+        if (self.revision or self.IPN) and (
+            Part.objects.exclude(pk=self.pk)
+            .filter(name=self.name, revision=self.revision, IPN=self.IPN)
+            .exists()
+        ):
+            raise ValidationError(
+                _('Part with this Name, IPN and Revision already exists.')
+            )
 
     def clean(self):
         """Perform cleaning operations for the Part model.
@@ -1164,6 +1177,12 @@ class Part(
         default=part_settings.part_trackable_default,
         verbose_name=_('Trackable'),
         help_text=_('Does this part have tracking for unique items?'),
+    )
+
+    testable = models.BooleanField(
+        default=False,
+        verbose_name=_('Testable'),
+        help_text=_('Can this part have test results recorded against it?'),
     )
 
     purchaseable = models.BooleanField(
@@ -1930,7 +1949,7 @@ class Part(
 
         return pricing
 
-    def schedule_pricing_update(self, create: bool = False, test: bool = False):
+    def schedule_pricing_update(self, create: bool = False):
         """Helper function to schedule a pricing update.
 
         Importantly, catches any errors which may occur during deletion of related objects,
@@ -1940,7 +1959,6 @@ class Part(
 
         Arguments:
             create: Whether or not a new PartPricing object should be created if it does not already exist
-            test: Whether or not the pricing update is allowed during unit tests
         """
         try:
             self.refresh_from_db()
@@ -1951,7 +1969,7 @@ class Part(
             pricing = self.pricing
 
             if create or pricing.pk:
-                pricing.schedule_for_update(test=test)
+                pricing.schedule_for_update()
         except IntegrityError:
             # If this part instance has been deleted,
             # some post-delete or post-save signals may still be fired
@@ -2531,7 +2549,8 @@ class PartPricing(common.models.MetaMixin):
     - Detailed pricing information is very context specific in any case
     """
 
-    price_modified = False
+    # When calculating assembly pricing, we limit the depth of the calculation
+    MAX_PRICING_DEPTH = 50
 
     @property
     def is_valid(self):
@@ -2560,13 +2579,9 @@ class PartPricing(common.models.MetaMixin):
 
         return result
 
-    def schedule_for_update(self, counter: int = 0, test: bool = False):
+    def schedule_for_update(self, counter: int = 0):
         """Schedule this pricing to be updated."""
         import InvenTree.ready
-
-        # If we are running within CI, only schedule the update if the test flag is set
-        if settings.TESTING and not test:
-            return
 
         # If importing data, skip pricing update
         if InvenTree.ready.isImportingData():
@@ -2611,7 +2626,7 @@ class PartPricing(common.models.MetaMixin):
             logger.debug('Pricing for %s already scheduled for update - skipping', p)
             return
 
-        if counter > 25:
+        if counter > self.MAX_PRICING_DEPTH:
             # Prevent infinite recursion / stack depth issues
             logger.debug(
                 counter, f'Skipping pricing update for {p} - maximum depth exceeded'
@@ -2630,16 +2645,36 @@ class PartPricing(common.models.MetaMixin):
 
         import part.tasks as part_tasks
 
+        # Pricing calculations are performed in the background,
+        # unless the TESTING_PRICING flag is set
+        background = not settings.TESTING or not settings.TESTING_PRICING
+
         # Offload task to update the pricing
-        # Force async, to prevent running in the foreground
+        # Force async, to prevent running in the foreground (unless in testing mode)
         InvenTree.tasks.offload_task(
-            part_tasks.update_part_pricing, self, counter=counter, force_async=True
+            part_tasks.update_part_pricing,
+            self,
+            counter=counter,
+            force_async=background,
         )
 
-    def update_pricing(self, counter: int = 0, cascade: bool = True):
-        """Recalculate all cost data for the referenced Part instance."""
-        # If importing data, skip pricing update
+    def update_pricing(
+        self,
+        counter: int = 0,
+        cascade: bool = True,
+        previous_min=None,
+        previous_max=None,
+    ):
+        """Recalculate all cost data for the referenced Part instance.
 
+        Arguments:
+            counter: Recursion counter (used to prevent infinite recursion)
+            cascade: If True, update pricing for all assemblies and templates which use this part
+            previous_min: Previous minimum price (used to prevent further updates if unchanged)
+            previous_max: Previous maximum price (used to prevent further updates if unchanged)
+
+        """
+        # If importing data, skip pricing update
         if InvenTree.ready.isImportingData():
             return
 
@@ -2670,18 +2705,25 @@ class PartPricing(common.models.MetaMixin):
             # Background worker processes may try to concurrently update
             pass
 
+        pricing_changed = False
+
+        # Without previous pricing data, we assume that the pricing has changed
+        if previous_min != self.overall_min or previous_max != self.overall_max:
+            pricing_changed = True
+
         # Update parent assemblies and templates
-        if cascade and self.price_modified:
+        if pricing_changed and cascade:
             self.update_assemblies(counter)
             self.update_templates(counter)
 
     def update_assemblies(self, counter: int = 0):
         """Schedule updates for any assemblies which use this part."""
         # If the linked Part is used in any assemblies, schedule a pricing update for those assemblies
+
         used_in_parts = self.part.get_used_in()
 
         for p in used_in_parts:
-            p.pricing.schedule_for_update(counter + 1)
+            p.pricing.schedule_for_update(counter=counter + 1)
 
     def update_templates(self, counter: int = 0):
         """Schedule updates for any template parts above this part."""
@@ -2697,13 +2739,13 @@ class PartPricing(common.models.MetaMixin):
 
         try:
             self.update_overall_cost()
-        except IntegrityError:
+        except Exception:
             # If something has happened to the Part model, might throw an error
             pass
 
         try:
             super().save(*args, **kwargs)
-        except IntegrityError:
+        except Exception:
             # This error may be thrown if there is already duplicate pricing data
             pass
 
@@ -2771,9 +2813,6 @@ class PartPricing(common.models.MetaMixin):
 
                 any_max_elements = True
 
-        old_bom_cost_min = self.bom_cost_min
-        old_bom_cost_max = self.bom_cost_max
-
         if any_min_elements:
             self.bom_cost_min = cumulative_min
         else:
@@ -2783,12 +2822,6 @@ class PartPricing(common.models.MetaMixin):
             self.bom_cost_max = cumulative_max
         else:
             self.bom_cost_max = None
-
-        if (
-            old_bom_cost_min != self.bom_cost_min
-            or old_bom_cost_max != self.bom_cost_max
-        ):
-            self.price_modified = True
 
         if save:
             self.save()
@@ -2853,12 +2886,6 @@ class PartPricing(common.models.MetaMixin):
                 if purchase_max is None or cost > purchase_max:
                     purchase_max = cost
 
-        if (
-            self.purchase_cost_min != purchase_min
-            or self.purchase_cost_max != purchase_max
-        ):
-            self.price_modified = True
-
         self.purchase_cost_min = purchase_min
         self.purchase_cost_max = purchase_max
 
@@ -2884,12 +2911,6 @@ class PartPricing(common.models.MetaMixin):
 
                 if max_int_cost is None or cost > max_int_cost:
                     max_int_cost = cost
-
-        if (
-            self.internal_cost_min != min_int_cost
-            or self.internal_cost_max != max_int_cost
-        ):
-            self.price_modified = True
 
         self.internal_cost_min = min_int_cost
         self.internal_cost_max = max_int_cost
@@ -2926,12 +2947,6 @@ class PartPricing(common.models.MetaMixin):
                     if max_sup_cost is None or cost > max_sup_cost:
                         max_sup_cost = cost
 
-        if (
-            self.supplier_price_min != min_sup_cost
-            or self.supplier_price_max != max_sup_cost
-        ):
-            self.price_modified = True
-
         self.supplier_price_min = min_sup_cost
         self.supplier_price_max = max_sup_cost
 
@@ -2966,9 +2981,6 @@ class PartPricing(common.models.MetaMixin):
                 if v_max is not None:
                     if variant_max is None or v_max > variant_max:
                         variant_max = v_max
-
-        if self.variant_cost_min != variant_min or self.variant_cost_max != variant_max:
-            self.price_modified = True
 
         self.variant_cost_min = variant_min
         self.variant_cost_max = variant_max
@@ -3089,12 +3101,6 @@ class PartPricing(common.models.MetaMixin):
 
             if max_sell_history is None or cost > max_sell_history:
                 max_sell_history = cost
-
-        if (
-            self.sale_history_min != min_sell_history
-            or self.sale_history_max != max_sell_history
-        ):
-            self.price_modified = True
 
         self.sale_history_min = min_sell_history
         self.sale_history_max = max_sell_history
@@ -3563,9 +3569,9 @@ class PartTestTemplate(InvenTree.models.InvenTreeMetadataModel):
 
     def validate_unique(self, exclude=None):
         """Test that this test template is 'unique' within this part tree."""
-        if not self.part.trackable:
+        if not self.part.testable:
             raise ValidationError({
-                'part': _('Test templates can only be created for trackable parts')
+                'part': _('Test templates can only be created for testable parts')
             })
 
         # Check that this test is unique within the part tree
@@ -3586,7 +3592,7 @@ class PartTestTemplate(InvenTree.models.InvenTreeMetadataModel):
         Part,
         on_delete=models.CASCADE,
         related_name='test_templates',
-        limit_choices_to={'trackable': True},
+        limit_choices_to={'testable': True},
         verbose_name=_('Part'),
     )
 
@@ -3865,16 +3871,18 @@ class PartParameter(InvenTree.models.InvenTreeMetadataModel):
         super().clean()
 
         # Validate the parameter data against the template units
-        if get_global_setting(
-            'PART_PARAMETER_ENFORCE_UNITS', True, cache=False, create=False
+        if (
+            get_global_setting(
+                'PART_PARAMETER_ENFORCE_UNITS', True, cache=False, create=False
+            )
+            and self.template.units
         ):
-            if self.template.units:
-                try:
-                    InvenTree.conversion.convert_physical_value(
-                        self.data, self.template.units
-                    )
-                except ValidationError as e:
-                    raise ValidationError({'data': e.message})
+            try:
+                InvenTree.conversion.convert_physical_value(
+                    self.data, self.template.units
+                )
+            except ValidationError as e:
+                raise ValidationError({'data': e.message})
 
         # Validate the parameter data against the template choices
         if choices := self.template.get_choices():
@@ -4182,9 +4190,8 @@ class BomItem(
         # Check if the part was changed
         deltas = self.get_field_deltas()
 
-        if 'part' in deltas:
-            if old_part := deltas['part'].get('old', None):
-                self.check_part_lock(old_part)
+        if 'part' in deltas and (old_part := deltas['part'].get('old', None)):
+            self.check_part_lock(old_part)
 
         # Update the 'validated' field based on checksum calculation
         self.validated = self.is_line_valid
@@ -4321,7 +4328,7 @@ class BomItem(
         - allow_variants
         """
         # Seed the hash with the ID of this BOM item
-        result_hash = hashlib.md5(''.encode())
+        result_hash = hashlib.md5(b'')
 
         # The following components are used to calculate the checksum
         components = [
@@ -4415,8 +4422,7 @@ class BomItem(
         try:
             ovg = float(overage)
 
-            if ovg < 0:
-                ovg = 0
+            ovg = max(ovg, 0)
 
             return ovg
         except ValueError:
@@ -4428,10 +4434,8 @@ class BomItem(
 
             try:
                 percent = float(overage) / 100.0
-                if percent > 1:
-                    percent = 1
-                if percent < 0:
-                    percent = 0
+                percent = min(percent, 1)
+                percent = max(percent, 0)
 
                 # Must be represented as a decimal
                 percent = Decimal(percent)
@@ -4508,7 +4512,10 @@ def update_bom_build_lines(sender, instance, created, **kwargs):
 def update_pricing_after_edit(sender, instance, created, **kwargs):
     """Callback function when a part price break is created or updated."""
     # Update part pricing *unless* we are importing data
-    if InvenTree.ready.canAppAccessDatabase() and not InvenTree.ready.isImportingData():
+    if (
+        InvenTree.ready.canAppAccessDatabase(allow_test=settings.TESTING_PRICING)
+        and not InvenTree.ready.isImportingData()
+    ):
         if instance.part:
             instance.part.schedule_pricing_update(create=True)
 
@@ -4525,7 +4532,10 @@ def update_pricing_after_edit(sender, instance, created, **kwargs):
 def update_pricing_after_delete(sender, instance, **kwargs):
     """Callback function when a part price break is deleted."""
     # Update part pricing *unless* we are importing data
-    if InvenTree.ready.canAppAccessDatabase() and not InvenTree.ready.isImportingData():
+    if (
+        InvenTree.ready.canAppAccessDatabase(allow_test=settings.TESTING_PRICING)
+        and not InvenTree.ready.isImportingData()
+    ):
         if instance.part:
             instance.part.schedule_pricing_update(create=False)
 

@@ -1,6 +1,7 @@
 import { t } from '@lingui/macro';
 import { Text } from '@mantine/core';
 import {
+  IconHash,
   IconShoppingCart,
   IconSquareArrowRight,
   IconTools
@@ -14,7 +15,11 @@ import { ApiEndpoints } from '../../enums/ApiEndpoints';
 import { ModelType } from '../../enums/ModelType';
 import { UserRoles } from '../../enums/Roles';
 import { useBuildOrderFields } from '../../forms/BuildForms';
-import { useSalesOrderLineItemFields } from '../../forms/SalesOrderForms';
+import {
+  useSalesOrderAllocateSerialsFields,
+  useSalesOrderLineItemFields
+} from '../../forms/SalesOrderForms';
+import { notYetImplemented } from '../../functions/notifications';
 import {
   useCreateApiFormModal,
   useDeleteApiFormModal,
@@ -27,6 +32,7 @@ import { TableColumn } from '../Column';
 import { DateColumn, LinkColumn, PartColumn } from '../ColumnRenderers';
 import { InvenTreeTable } from '../InvenTreeTable';
 import {
+  RowAction,
   RowDeleteAction,
   RowDuplicateAction,
   RowEditAction
@@ -35,10 +41,12 @@ import { TableHoverCard } from '../TableHoverCard';
 
 export default function SalesOrderLineItemTable({
   orderId,
+  currency,
   customerId,
   editable
 }: {
   orderId: number;
+  currency: string;
   customerId: number;
   editable: boolean;
 }) {
@@ -191,7 +199,10 @@ export default function SalesOrderLineItemTable({
     url: ApiEndpoints.sales_order_line_list,
     title: t`Add Line Item`,
     fields: createLineFields,
-    initialData: initialData,
+    initialData: {
+      ...initialData,
+      sale_price_currency: currency
+    },
     table: table
   });
 
@@ -213,6 +224,19 @@ export default function SalesOrderLineItemTable({
     url: ApiEndpoints.sales_order_line_list,
     pk: selectedLine,
     title: t`Delete Line Item`,
+    table: table
+  });
+
+  const allocateSerialFields = useSalesOrderAllocateSerialsFields({
+    itemId: selectedLine,
+    orderId: orderId
+  });
+
+  const allocateBySerials = useCreateApiFormModal({
+    url: ApiEndpoints.sales_order_allocate_serials,
+    pk: orderId,
+    title: t`Allocate Serial Numbers`,
+    fields: allocateSerialFields,
     table: table
   });
 
@@ -243,7 +267,7 @@ export default function SalesOrderLineItemTable({
   }, [user, orderId]);
 
   const rowActions = useCallback(
-    (record: any) => {
+    (record: any): RowAction[] => {
       const allocated = (record?.allocated ?? 0) > (record?.quantity ?? 0);
 
       return [
@@ -254,7 +278,22 @@ export default function SalesOrderLineItemTable({
             !user.hasChangeRole(UserRoles.sales_order),
           title: t`Allocate stock`,
           icon: <IconSquareArrowRight />,
-          color: 'green'
+          color: 'green',
+          onClick: notYetImplemented
+        },
+        {
+          hidden:
+            !record?.part_detail?.trackable ||
+            allocated ||
+            !editable ||
+            !user.hasChangeRole(UserRoles.sales_order),
+          title: t`Allocate Serials`,
+          icon: <IconHash />,
+          color: 'green',
+          onClick: () => {
+            setSelectedLine(record.pk);
+            allocateBySerials.open();
+          }
         },
         {
           hidden:
@@ -280,7 +319,8 @@ export default function SalesOrderLineItemTable({
             !record?.part_detail?.purchaseable,
           title: t`Order stock`,
           icon: <IconShoppingCart />,
-          color: 'blue'
+          color: 'blue',
+          onClick: notYetImplemented
         },
         RowEditAction({
           hidden: !editable || !user.hasChangeRole(UserRoles.sales_order),
@@ -314,6 +354,7 @@ export default function SalesOrderLineItemTable({
       {deleteLine.modal}
       {newLine.modal}
       {newBuildOrder.modal}
+      {allocateBySerials.modal}
       <InvenTreeTable
         url={apiUrl(ApiEndpoints.sales_order_line_list)}
         tableState={table}

@@ -323,6 +323,7 @@ class PartBriefSerializer(InvenTree.serializers.InvenTreeModelSerializer):
             'is_template',
             'purchaseable',
             'salable',
+            'testable',
             'trackable',
             'virtual',
             'units',
@@ -346,6 +347,17 @@ class PartBriefSerializer(InvenTree.serializers.InvenTreeModelSerializer):
 
     image = InvenTree.serializers.InvenTreeImageSerializerField(read_only=True)
     thumbnail = serializers.CharField(source='get_thumbnail_url', read_only=True)
+
+    IPN = serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text=_('Internal Part Number'),
+        max_length=100,
+    )
+
+    revision = serializers.CharField(
+        required=False, default='', allow_blank=True, allow_null=True, max_length=100
+    )
 
     # Pricing fields
     pricing_min = InvenTree.serializers.InvenTreeMoneySerializer(
@@ -673,6 +685,7 @@ class PartSerializer(
             'salable',
             'starred',
             'thumbnail',
+            'testable',
             'trackable',
             'units',
             'variant_of',
@@ -887,6 +900,14 @@ class PartSerializer(
 
     creation_user = serializers.PrimaryKeyRelatedField(
         queryset=users.models.User.objects.all(), required=False, allow_null=True
+    )
+
+    IPN = serializers.CharField(
+        required=False, default='', allow_blank=True, label=_('IPN'), max_length=100
+    )
+
+    revision = serializers.CharField(
+        required=False, default='', allow_blank=True, allow_null=True, max_length=100
     )
 
     # Annotated fields
@@ -1977,9 +1998,8 @@ class BomImportExtractSerializer(InvenTree.serializers.DataFileExtractSerializer
 
         if part is None:
             row['errors']['part'] = _('No matching part found')
-        else:
-            if not part.component:
-                row['errors']['part'] = _('Part is not designated as a component')
+        elif not part.component:
+            row['errors']['part'] = _('Part is not designated as a component')
 
         # Update the 'part' value in the row
         row['part'] = part.pk if part is not None else None
